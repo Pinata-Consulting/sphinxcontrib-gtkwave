@@ -5,7 +5,7 @@ from PIL import ImageFilter
 import docutils.parsers.rst.directives.images
 import logging
 import os
-import path
+from path import Path
 import tempfile
 
 """
@@ -17,7 +17,7 @@ import tempfile
 
 """
 
-__version__ = '0.0.6'
+__version__ = '0.1'
 
 log = logging.getLogger(__name__)
 log.debug('sphinxcontrib.gtkwave (version:%s)' % __version__)
@@ -94,8 +94,8 @@ def prog_shot(cmd, f, wait, timeout, screen_size, visible, bgcolor):
 
     :param wait: int
     '''
-    disp = SmartDisplay(visible=visible, size=screen_size, bgcolor=bgcolor)
-    proc = EasyProcess(cmd)
+    # disp = SmartDisplay(visible=visible, size=screen_size, bgcolor=bgcolor)
+    # proc = EasyProcess(cmd)
 
     def cb_imgcheck(img):
         """accept img if height > minimum."""
@@ -108,16 +108,18 @@ def prog_shot(cmd, f, wait, timeout, screen_size, visible, bgcolor):
             (left, upper, right, lower)) + ' accepted=' + str(accept))
         return accept
 
-    def func():
+    with  SmartDisplay(visible=visible, size=screen_size, bgcolor=bgcolor) as disp:
+     with EasyProcess(cmd) as proc:
+    # def func():
         if wait:
             proc.sleep(wait)
         try:
             img = disp.waitgrab(timeout=timeout, cb_imgcheck=cb_imgcheck)
-        except DisplayTimeoutError, e:
+        except DisplayTimeoutError as e:
             raise DisplayTimeoutError(str(e) + ' ' + str(proc))
-        return img
+        # return img
 
-    img = disp.wrap(proc.wrap(func))()
+    # img = disp.wrap(proc.wrap(func))()
     if img:
         bbox = get_black_box(img)
         assert bbox
@@ -157,36 +159,41 @@ class GtkwaveDirective(parent):
 
         vcd = str(self.arguments[0])
 
-        tclfile = tempfile.NamedTemporaryFile(
-            prefix='gtkwave', suffix='.tcl', delete=0)
-        tclfile.write(tcl)
-        tclfile.close()
+        with tempfile.TemporaryDirectory(prefix='gtkwave') as tmpdirname:
+            tclfile = Path(tmpdirname) / 'gtkwave.tcl'
+            tclfile.write_text(tcl)
+            # tempfile.NamedTemporaryFile(
+                # prefix='gtkwave', suffix='.tcl', delete=0)
+            # tclfile.write(tcl)
+            # tclfile.close()
 
-        rcfile = tempfile.NamedTemporaryFile(
-            prefix='gtkwave', suffix='.rc', delete=0)
-        rcfile.write(rc)
-        rcfile.close()
+            rcfile = Path(tmpdirname) / 'gtkwave.rc'
+            rcfile.write_text(rc)
+            # rcfile = tempfile.NamedTemporaryFile(
+            #     prefix='gtkwave', suffix='.rc', delete=0)
+            # rcfile.write(rc)
+            # rcfile.close()
 
-        cmd = ['gtkwave',
-               vcd,
-               '--tcl_init',
-               tclfile.name,
-               '--rcfile',
-               rcfile.name,
-               '--nomenu',
-               ]
+            cmd = ['gtkwave',
+                vcd,
+                '--tcl_init',
+                tclfile,
+                '--rcfile',
+                rcfile,
+                '--nomenu',
+                ]
 
-        global image_id
-        f = 'gtkwave_id%s.png' % (str(image_id))
-        image_id += 1
-        fabs = path.path(get_src(self)).dirname() / (f)
-        images_to_delete.append(fabs)
+            global image_id
+            f = 'gtkwave_id%s.png' % (str(image_id))
+            image_id += 1
+            fabs = Path(get_src(self)).dirname() / (f)
+            images_to_delete.append(fabs)
 
-        prog_shot(cmd, fabs, screen_size=screen, wait=wait,
-                  timeout=timeout, visible=visible, bgcolor=bgcolor)
+            prog_shot(cmd, fabs, screen_size=screen, wait=wait,
+                    timeout=timeout, visible=visible, bgcolor=bgcolor)
 
-        os.remove(tclfile.name)
-        os.remove(rcfile.name)
+        # os.remove(tclfile.name)
+        # os.remove(rcfile.name)
 
         self.arguments[0] = f
         x = parent.run(self)
@@ -225,7 +232,7 @@ class GtkwaveDirective(parent):
 
 def cleanup(app, exception):
     for x in images_to_delete:
-        f = path.path(x)
+        f = Path(x)
         if f.exists():
             log.debug('removing image:' + x)
             f.remove()

@@ -1,6 +1,6 @@
-path.py
+path
 EasyProcess
 pyvirtualdisplay
-pyscreenshot
+pillow
 Sphinx>=1.0
 
