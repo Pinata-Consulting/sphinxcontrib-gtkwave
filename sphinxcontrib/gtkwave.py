@@ -1,3 +1,4 @@
+import subprocess
 from docutils.parsers.rst import directives
 from easyprocess import EasyProcess
 from pyvirtualdisplay.smartdisplay import SmartDisplay, DisplayTimeoutError
@@ -5,9 +6,13 @@ from PIL import ImageFilter
 import docutils.parsers.rst.directives.images
 import logging
 import os
-from path import Path
+import pathlib
 import tempfile
+from docutils import nodes
+import pickle
+import re
 
+import hashlib
 """
     sphinxcontrib.gtkwave
     ================================
@@ -25,6 +30,7 @@ log.debug('sphinxcontrib.gtkwave (version:%s)' % __version__)
 
 class GtkwaveError(Exception):
     pass
+
 
 tcl = r'''
 set clk48 [list]
@@ -55,11 +61,15 @@ set min_time [ gtkwave::getMinTime ]
 gtkwave::setZoomRangeTimes $min_time $max_time
 '''
 
+tcl_with_gtkw = r'''
+gtkwave::setLeftJustifySigs on
+'''
+
 rc = r'''
 hide_sst 1
 splash_disable 1
 enable_vert_grid 0
-
+ignore_savefile_pos 1
 '''
 
 
@@ -76,12 +86,12 @@ def get_black_box(im):
     im6 = im.crop(bbox)
     bbox2 = im6.getbbox()
     if bbox and bbox2:
-        bbox3 = (bbox[0] + bbox2[0],
-                 bbox[1] + bbox2[1],
-                 bbox[0] + bbox2[2],
-                 bbox[1] + bbox2[3],
-
-                 )
+        bbox3 = (
+            bbox[0] + bbox2[0],
+            bbox[1] + bbox2[1],
+            bbox[0] + bbox2[2],
+            bbox[1] + bbox2[3],
+        )
         return bbox3
 
 
@@ -94,8 +104,8 @@ def prog_shot(cmd, f, wait, timeout, screen_size, visible, bgcolor):
 
     :param wait: int
     '''
-    # disp = SmartDisplay(visible=visible, size=screen_size, bgcolor=bgcolor)
-    # proc = EasyProcess(cmd)
+    disp = SmartDisplay(visible=visible, size=screen_size, bgcolor=bgcolor)
+    proc = EasyProcess(cmd)
 
     def cb_imgcheck(img):
         """accept img if height > minimum."""
@@ -104,8 +114,8 @@ def prog_shot(cmd, f, wait, timeout, screen_size, visible, bgcolor):
             return False
         left, upper, right, lower = rec
         accept = lower - upper > 30  # pixel
-        log.debug('cropped img size=' + str(
-            (left, upper, right, lower)) + ' accepted=' + str(accept))
+        log.debug('cropped img size=' + str((left, upper, right, lower)) +
+                  ' accepted=' + str(accept))
         return accept
 
     with  SmartDisplay(visible=visible, size=screen_size, bgcolor=bgcolor) as disp:
@@ -116,10 +126,12 @@ def prog_shot(cmd, f, wait, timeout, screen_size, visible, bgcolor):
         try:
             img = disp.waitgrab(timeout=timeout, cb_imgcheck=cb_imgcheck)
         except DisplayTimeoutError as e:
+            if not proc.is_alive():
+                print("gtkwave stderr: " + proc.stderr)
+                print("gtkwave stdout: " + proc.stdout)
             raise DisplayTimeoutError(str(e) + ' ' + str(proc))
         # return img
 
-    # img = disp.wrap(proc.wrap(func))()
     if img:
         bbox = get_black_box(img)
         assert bbox
@@ -132,115 +144,167 @@ def prog_shot(cmd, f, wait, timeout, screen_size, visible, bgcolor):
 
 
 parent = docutils.parsers.rst.directives.images.Image
-images_to_delete = []
 image_id = 0
 
 
 class GtkwaveDirective(parent):
     option_spec = parent.option_spec.copy()
-    option_spec.update(dict(
-                       #                       prompt=directives.flag,
-                       screen=directives.unchanged,
-                       wait=directives.nonnegative_int,
-                       #                       stdout=directives.flag,
-                       #                       stderr=directives.flag,
-                       visible=directives.flag,
-                       timeout=directives.nonnegative_int,
-                       bgcolor=directives.unchanged,
-                       ))
+    option_spec.update(
+        dict(
+            #                       prompt=directives.flag,
+            screen=directives.unchanged,
+            wait=directives.nonnegative_int,
+            #                       stdout=directives.flag,
+            #                       stderr=directives.flag,
+            visible=directives.flag,
+            timeout=directives.nonnegative_int,
+            bgcolor=directives.unchanged,
+        ))
 
     def run(self):
+        '''Collect information, but do not generate files here'''
+        vcd = [
+            self.state.document.settings.env.relfn2path(f)[1]
+            for f in self.arguments[0].split()
+        ]
+
+        node = gtkwave()
+
         screen = self.options.get('screen', '1024x768')
         screen = tuple(map(int, screen.split('x')))
-        wait = self.options.get('wait', 0)
+        wait = self.options.get('wait', 1)
         timeout = self.options.get('timeout', 12)
         bgcolor = self.options.get('bgcolor', 'white')
         visible = 'visible' in self.options
 
-        vcd = str(self.arguments[0])
+        node['screen'] = screen
+        node['wait'] = wait
+        node['timeout'] = timeout
+        node['bgcolor'] = bgcolor
+        node['visible'] = visible
 
-        with tempfile.TemporaryDirectory(prefix='gtkwave') as tmpdirname:
-            tclfile = Path(tmpdirname) / 'gtkwave.tcl'
-            tclfile.write_text(tcl)
-            # tempfile.NamedTemporaryFile(
-                # prefix='gtkwave', suffix='.tcl', delete=0)
-            # tclfile.write(tcl)
-            # tclfile.close()
+        node['vcd'] = vcd
 
-            rcfile = Path(tmpdirname) / 'gtkwave.rc'
-            rcfile.write_text(rc)
-            # rcfile = tempfile.NamedTemporaryFile(
-            #     prefix='gtkwave', suffix='.rc', delete=0)
-            # rcfile.write(rc)
-            # rcfile.close()
-
-            cmd = ['gtkwave',
-                vcd,
-                '--tcl_init',
-                tclfile,
-                '--rcfile',
-                rcfile,
-                '--nomenu',
-                ]
-
-            global image_id
-            f = 'gtkwave_id%s.png' % (str(image_id))
-            image_id += 1
-            fabs = Path(get_src(self)).dirname() / (f)
-            images_to_delete.append(fabs)
-
-            prog_shot(cmd, fabs, screen_size=screen, wait=wait,
-                    timeout=timeout, visible=visible, bgcolor=bgcolor)
-
-        # os.remove(tclfile.name)
-        # os.remove(rcfile.name)
-
-        self.arguments[0] = f
-        x = parent.run(self)
-
-#        output = ''
-#        if 'stdout' in self.options:
-#            output += o[0]
-#            if o[0]:
-#                output += '\n'
-
-#        if 'stderr' in self.options:
-#            output += o[1]
-#            if o[1]:
-#                output += '\n'
-
-#        if 'prompt' in self.options:
-            # TODO:
-            # if app.config.programoutput_use_ansi:
-            # enable ANSI support, if requested by config
-            #    from sphinxcontrib.ansi import ansi_literal_block
-            #    node_class = ansi_literal_block
-            # else:
-            #    node_class = nodes.literal_block
-
-            # TODO: get app
-            # tmpl = app.config.programoutput_prompt_template
-#            tmpl = '$ %(command)s\n%(output)s'
-#            output = tmpl % dict(command=cmd, output=output)
-
-#        node_class = nodes.literal_block
-#        if output:
-#            x = [node_class(output, output)] + x
-
-        return x
+        return [node]
 
 
-def cleanup(app, exception):
-    for x in images_to_delete:
-        f = Path(x)
-        if f.exists():
-            log.debug('removing image:' + x)
-            f.remove()
+class GtkwaveBuilder(object):
+    def __init__(self, builder):
+        self.builder = builder
+
+
+def _on_builder_inited(app):
+    app.builder.gtkwave_builder = GtkwaveBuilder(app.builder)
+
+
+def hash_gtkwave_node(node):
+    h = hashlib.sha1()
+    # may include different file relative to doc
+    h.update(pickle.dumps(node['vcd']))
+    h.update(b'\0')
+    #h.update(node['uml'].encode('utf-8'))
+    return h.hexdigest()
+
+
+def generate_name(self, node, fileformat):
+    key = hash_gtkwave_node(node)
+    fname = 'gtkwave-%s.%s' % (key, fileformat)
+    imgpath = getattr(self.builder, 'imgpath', None)
+    if imgpath:
+        return ('/'.join((self.builder.imgpath, fname)),
+                os.path.join(self.builder.outdir, '_images', fname))
+    else:
+        return fname, os.path.join(self.builder.outdir, fname)
+
+
+def _get_png_tag(self, fnames, node):
+    refname, outfname = fnames['png']
+    alt = node.get('alt', " ".join(node['vcd']))
+
+    return ('<img src="%s" alt="%s"/>\n' % (self.encode(refname),
+                                            self.encode(alt)))
+
+
+def render_gtkwave(self, node):
+    # TODO use the caching capability in Sphinx to avoid re-rendering image
+    # put node representing rendered image
+    refname, outfname = generate_name(self, node, "png")
+
+    vcd = node['vcd']
+
+    with tempfile.NamedTemporaryFile(
+            prefix='gtkwave', suffix='.tcl', delete=0) as tclfile:
+        tclfile.write((tcl
+                       if len(vcd) == 1 else tcl_with_gtkw).encode('utf-8'))
+
+    with tempfile.NamedTemporaryFile(
+            prefix='gtkwave', suffix='.rc', delete=0) as rcfile:
+        rcfile.write(rc.encode('utf-8'))
+
+    cmd = ['gtkwave'] + vcd + [
+        '--tcl_init',
+        tclfile.name,
+        '--rcfile',
+        rcfile.name,
+        '--nomenu',
+    ]
+
+    print("running:" + subprocess.list2cmdline(cmd))
+
+    prog_shot(
+        cmd,
+        outfname,
+        screen_size=node['screen'],
+        wait=node['wait'],
+        timeout=node['timeout'],
+        visible=node['visible'],
+        bgcolor=node['bgcolor'])
+
+    # if the build fails, we never reach this point and we can re-run the logged command line.
+    os.remove(tclfile.name)
+    os.remove(rcfile.name)
+
+    return (refname, outfname)
+
+
+def html_visit_gtkwave(self, node):
+    refname, outfname = render_gtkwave(self, node)
+
+    fnames = {"png": (refname, outfname)}
+
+    self.body.append(self.starttag(node, 'p', CLASS='plantuml'))
+    self.body.append(_get_png_tag(self, fnames, node))
+    self.body.append('</p>\n')
+
+    # rep = nodes.image(uri=outfname)
+    # node.parent.replace(node, rep)
+    raise nodes.SkipNode
+
+
+def latex_visit_gtkwave(self, node):
+    refname, outfname = render_gtkwave(self, node)
+
+    # put node representing rendered image
+    img_node = nodes.image(uri=refname, **node.attributes)
+    img_node.delattr('uml')
+    node.append(img_node)
+
+
+def latex_depart_gtkwave(self, node):
+    pass
+
+
+_NODE_VISITORS = {
+    'html': (html_visit_gtkwave, None),
+    'latex': (latex_visit_gtkwave, latex_depart_gtkwave)
+}
+
+
+class gtkwave(nodes.General, nodes.Element):
+    pass
 
 
 def setup(app):
-    # app.add_config_value('programoutput_use_ansi', False, 'env')
-    # app.add_config_value('gtkwave_prompt_template',
-    #                     '$ %(command)s\n%(output)s', 'env')
+    app.add_node(gtkwave, **_NODE_VISITORS)
     app.add_directive('gtkwave', GtkwaveDirective)
-    app.connect('build-finished', cleanup)
+    app.connect('builder-inited', _on_builder_inited)
